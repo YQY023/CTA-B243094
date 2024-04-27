@@ -1,0 +1,354 @@
+---
+title: "CTA-FA"
+author: "Yan Qingyang"
+date: "2024-04-24"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r}
+#get sessions ready
+library(tidyverse) # loads dplyr, ggplot2, and others
+library(stringr) # to handle text elements
+library(tidytext) # includes set of functions useful for manipulating text
+library(topicmodels) # to estimate topic models
+library(gutenbergr) # to get text data
+library(scales)
+library(ggplot2)
+library(dplyr)
+library(tm)
+library(ggthemes) # to make your plots look nice
+library(readr)# more informative and easy way to import data
+library(quanteda)
+library(quanteda.textmodels)
+devtools::install_github("matthewjdenny/preText")
+library(preText)
+library(academictwitteR) # for fetching Twitter data
+library(textdata)
+```
+
+```{r}
+#input the data of 8 newspapers in the UK 
+tweets  <- readRDS("/Users/a1397135541/Downloads/newstweets.rds")
+
+#have a look at the data
+head(tweets)
+colnames(tweets)
+glimpse(tweets)
+summary(tweets)
+
+#only keep the variables that we are interested at 
+tidy_tweets <- tweets %>%
+  select(user_username, text, created_at, user_name,
+         retweet_count, like_count, quote_count) %>%
+  rename(username = user_username,
+         newspaper = user_name,
+         tweet = text)
+
+
+```
+
+
+
+## start with word frequency analysis
+```{r}
+#recode created_at to day
+library(lubridate)
+
+tidy_tweets$day <- ymd_hms(tidy_tweets$created_at)
+tidy_tweets$day <- format(tidy_tweets$day, "%Y-%m-%d")
+
+
+# get simplified dataset with only event contents and year
+tidy_tweets_conyr <- tidy_tweets %>%
+  select(tweet, day)
+head(tidy_tweets_conyr)
+
+#have a look at the number of tweets posted a day
+tidy_tweets_conyr_day <- tidy_tweets_conyr %>%
+  mutate(obs=1) %>%
+  group_by(day) %>%
+  summarise(sum_tweet = sum(obs))
+tidy_tweets_conyr_day
+
+# plot the trendency
+ggplot(data = tidy_tweets_conyr_day, aes(x = as.Date(day), y = sum_tweet)) +
+  geom_line() + 
+  labs(x = "Month", y = "Total Tweets", title = "Total Tweets Over Time") +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") + 
+  theme_minimal()
+
+#get year and word for every word and date pair in the dataset
+tidy_tweets <- tidy_tweets %>% 
+  mutate(desc = tolower(tweet)) %>%
+  unnest_tokens(word, desc) %>%
+  filter(str_detect(word, "[a-z]"))
+
+#remove all the stop words and html words
+tidy_tweets <- tidy_tweets %>%
+    filter(!word %in% stop_words$word)
+
+#define html words
+remove_reg <- c("https", "t.co", "&amp;","&lt;","&gt;","<p>", "</p>","&rsquo", "&lsquo;",  "&#39;", "<strong>", "</strong>", "rsquo", "em", "ndash", "nbsp", "lsquo", "strong")
+   
+#remove html words               
+tidy_tweets <- tidy_tweets %>%
+  filter(!word %in% remove_reg)
+
+#have a look at the most common words in the data
+tidy_tweets %>%
+  count(word, sort = TRUE)
+
+#collect them into a dataframe
+tweets_term_counts <- tidy_tweets %>% 
+  group_by(day) %>%
+  count(word, sort = TRUE)
+head(tweets_term_counts)
+
+#analyze key words
+tweets_term_counts$coronword <- as.integer(grepl("coronavirus|pandemic|COVID-19|outbreak|virus|infection|quarantine|lockdown|vaccine|variant|cases|symptoms|hospitalization|mortality|contact tracing|social distancing|mask mandate|herd immunity", 
+                                            x = tweets_term_counts$word))
+
+#get counts by day and word
+tweets_counts <- tweets_term_counts %>%
+  group_by(day) %>%
+  mutate(day_total = sum(n)) %>%
+  filter(coronword==1) %>%
+  summarise(sum_coron = sum(n),
+            day_total= min(day_total))
+head(tweets_counts)
+
+#plot time trend
+ggplot(tweets_counts, aes(as.Date(day), sum_coron / day_total, group=1)) +
+  geom_line() +
+    geom_vline(xintercept = as.Date("2020-03-01"), col="red") +
+    geom_text(aes(x=as.Date("2020-03-20"), label="#U.S. annoucement", y=.008), 
+            colour="black", angle=0, text=element_text(size=5)) +
+  xlab("Month") +
+  ylab("% coronavirus-related words") +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") + 
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = c(0, 0), limits = c(0, NA)) +
+  theme_tufte(base_family = "Helvetica") 
+
+
+```
+
+
+
+##Topic Modelling
+```{r}
+library(tidyverse) # loads dplyr, ggplot2, and others
+library(stringr) # to handle text elements
+library(tidytext) # includes set of functions useful for manipulating text
+library(topicmodels) # to estimate topic models
+library(gutenbergr) # to get text data
+library(scales)
+library(tm)
+library(ggthemes) # to make your plots look nice
+library(readr)
+library(quanteda)
+library(quanteda.textmodels)
+#devtools::install_github("matthewjdenny/preText")
+library(preText)
+
+
+# defining what is html word
+remove_reg <- c("https", "t.co", "rt", "&amp;","&lt;","&gt;","<p>", "</p>","&rsquo", "&lsquo;",  "&#39;", "<strong>", "</strong>", "rsquo", "em", "ndash", "nbsp", "lsquo", "strong")
+
+#devide data into two groups by their political attitudes
+tweets_mod <- tweets %>%
+  mutate(group = ifelse(user_name %in% c("The Sun", "Daily Mail U.K.", "Metro", "The Mirror"), "News1", "News2"))
+
+#count words appear time
+tweets_mod_words <- tweets_mod %>%
+  mutate(newsnumber = ifelse(group == "News1", "Tabloids", "Mainstream")) %>%
+  unnest_tokens(word, text) %>%
+  filter(!is.na(word)) %>%
+  count(newsnumber, word, sort = TRUE) %>%
+  ungroup() %>%
+  anti_join(stop_words)%>%
+  filter(!word %in% remove_reg)
+
+# construct a document-term matrix (DTM)
+tweets_mod_dtm <- tweets_mod_words %>%
+  cast_dtm(newsnumber, word, n)
+
+# have a look at this DTM
+tm::inspect(tweets_mod_dtm)
+
+```
+
+```{r}
+
+# using latent dirichlet analysis (LDA) to get the top 10 topic
+tweets_mod_lda <- LDA(tweets_mod_dtm, k = 10, control = list(seed = 1234))
+
+# "beta" shows the probability of word belonging to which topic
+tweets_mod_topics <- tidy(tweets_mod_lda, matrix = "beta")
+
+# have a brief look at the results
+head(tweets_mod_topics, n = 10)
+```
+
+```{r}
+
+# extract top 10 word of each topic, ranking them by their topic and importance
+tweets_top_terms <- tweets_mod_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# plot the results
+tweets_top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free", ncol = 4) +
+  scale_y_reordered() +
+  theme_tufte(base_family = "Helvetica")
+```
+
+
+```{r}
+
+# tokenize and remove stop words or html words
+tidy_tweets_mod <- tweets_mod %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words)%>%
+   filter(!word %in% remove_reg)
+
+## Count most common words in both
+tidy_tweets_mod %>%
+  count(word, sort = TRUE)
+
+# count word frequency in different groups
+newsfreq <- tidy_tweets_mod %>%
+  mutate(newsnumber = ifelse(group=="News1", "Tabloids", "Mainstream")) %>%
+  mutate(word = str_extract(word, "[a-z']+")) %>%
+  count(newsnumber, word) %>%
+  group_by(newsnumber) %>%
+  mutate(proportion = n / sum(n)) %>% 
+  select(-n) %>% 
+  spread(newsnumber, proportion)
+
+# plot the results
+ggplot(newsfreq, aes(x = Tabloids, y = Mainstream, color = abs(Tabloids - Mainstream))) +
+  geom_abline(color = "gray40", lty = 2) +
+  geom_jitter(alpha = 0.1, size = 2.5, width = 0.3, height = 0.3) +
+  geom_text(aes(label = word), check_overlap = TRUE, vjust = 1.5) +
+  scale_x_log10(labels = percent_format()) +
+  scale_y_log10(labels = percent_format()) +
+  scale_color_gradient(limits = c(0, 0.001), low = "darkslategray4", high = "gray75") +
+  theme_tufte(base_family = "Helvetica") +
+  theme(legend.position="none", 
+        strip.background = element_blank(), 
+        strip.text.x = element_blank()) +
+  labs(x = "Mainstream", y = "Tabloids") +
+  coord_equal()
+```
+
+
+```{r}
+
+# clean NAs of text
+tweets_mod <- tweets_mod %>%
+  filter(!is.na(text))
+
+summary(tweets_mod)
+
+
+# Divide into documents, each representing one date
+tweets_date <- tweets_mod %>%
+  mutate(newsnumber = ifelse(group=="News1", "Tabloids", "Mainstream")) %>%
+  group_by(newsnumber) %>%
+  mutate(date = as.Date(created_at)) %>%
+  ungroup() %>%
+  filter(date > 0) %>%
+  unite(document, date)
+
+summary(tweets_date)
+
+
+# Split into words
+tweets_date_word <- tweets_date %>%
+  unnest_tokens(word, text)%>%
+   filter(!word %in% remove_reg)
+
+
+# Find document-word counts
+tweets_word_counts <- tweets_date_word %>%
+  anti_join(stop_words) %>%
+  count(document, word, sort = TRUE) %>%
+  ungroup()
+
+tweets_word_counts
+```
+
+
+```{r}
+
+# cast into DTM format for LDA analysis
+tweets_date_dtm <- tweets_word_counts %>%
+  cast_dtm(document, word, n)
+
+tm::inspect(tweets_date_dtm)
+# the result means that 98% of data are blank
+```
+
+```{r}
+
+# using LDA to get the association strength of two topics
+tweets_date_lda <- LDA(tweets_date_dtm, k = 2, control = list(seed = 1234))
+
+# "gamma" means the the probability distribution of each topic
+tweets_date_gamma <- tidy(tweets_date_lda, matrix = "gamma")
+tweets_date_gamma
+```
+
+
+
+##Validation
+```{r}
+# load in corpus of text data.
+ctweets_mod <- corpus(tweets_mod, text_field = "text")
+# use first 10 documents for example
+documents <- ctweets_mod[sample(1:30000,1000)]
+# take a look at the document names
+print(names(documents[1:10]))
+
+# preprocessing the ducuments
+preprocessed_documents <- factorial_preprocessing(
+    documents,
+    use_ngrams = TRUE,
+    infrequent_term_threshold = 0.2,
+    verbose = FALSE)
+
+# get preText score and comparing the similarity between different analyzing methods
+preText_results <- preText(
+    preprocessed_documents,
+    dataset_name = "Tweets text",
+    distance_method = "cosine",
+    num_comparisons = 20,
+    verbose = FALSE)
+
+# plot the results
+preText_score_plot(preText_results)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
